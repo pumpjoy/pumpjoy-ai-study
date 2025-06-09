@@ -289,6 +289,7 @@ def main():
   # Model, get logits
   model = GPT(GPTConfig())
   model.to(device) 
+  model = torch.compile(model)
   
   # Optimizer
   optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) # AdamW is a bug fixed of Adam
@@ -299,7 +300,13 @@ def main():
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16): # <---- This line
+        logits, loss = model(x, y)
+        # import code; code.interact(local=locals()) 
+        # logits.dtype                          # torch.bfloat16
+        # model.transformer.wte
+        # model.transformer.wte.weights
+        # model.transformer.wte.weights.dtype   # torch.float32
     loss.backward()
     optimizer.step()
     torch.cuda.synchronize()
