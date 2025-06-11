@@ -32,6 +32,8 @@ class MLP(nn.Module):
     x = self.c_proj(x)
     return x
 
+# class CausalSelfAttention(nn.Module):
+# Remove the 4 attention lines
 # GPT2: scale down at c_proj
 class CausalSelfAttention(nn.Module):
   # Multi-Headed Attention
@@ -188,6 +190,34 @@ class GPT(nn.Module):
                 sd[k].copy_(sd_hf[k])
 
     return model
+  
+  def configure_optimizers(self, weight_decay, learning_rate, device):
+    # Start with all of the candidate parameters (that require grad)
+    param_dict = {pn: p for pn, p in self.named_parameters()}
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+    
+    # Create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+    # i.e. All weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+    # Don't 1D tensors (Biases, LayerNorms, Scales).
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    optim_groups = [
+      {'params': decay_params, 'weight_decay': weight_decay},
+      {'params': nodecay_params, 'weight_decay': 0.0},
+    ]
+    
+    num_decay_params = sum(p.numel() for p in decay_params)
+    num_nodecay_params = sum(p.numel() for p in nodecay_params)
+    print(f"Num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameterss")
+    print(f"Num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+
+    # Create AdamW optimizer and use the fused version if it is available
+    import inspect
+    fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+    use_fused = fused_available and 'cuda' in device
+    print(f"Using fused AdamW: {use_fused}")
+    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+    return optimizer
 
   def forward(self, idx, targets=None):
     # idx is of shape (B, T)
@@ -258,9 +288,8 @@ class DataLoaderLite:
         if self.current_position + (B * T + 1) > len(self.tokens):
             self.current_position = 0
         return x, y
-  
-# -------------------------------------------------------------------
 
+# -------------------------------------------------------------------
 def main():
   device = "cpu"
   if torch.cuda.is_available():
@@ -273,10 +302,10 @@ def main():
   if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
   
-  # Dataset 
-  text = get_dataset()
+  # Dataset  
   """ Replaced with DataLoaderLite
   # Get databatch 
+  text = get_dataset()
   enc = tiktoken.get_encoding('gpt2')
   data = text[:1000] # Data is first 1000 characters (~3000 tokens)
   tokens = enc.encode(data)
@@ -284,22 +313,40 @@ def main():
   x = buf[:-1].view(4, 6) # Input to Transformer
   y = buf[1:].view(4, 6)# Label for training (with ground truth) 
   """
-   
   train_loader = DataLoaderLite(B=16, T=32)
   
   # Use T32 Format
   torch.set_float32_matmul_precision('high')
   
   # Model, get logits
-  model = GPT(GPTConfig())
+  model = GPT(GPTConfig(vocab_size=50304))
   model.to(device) 
   model = torch.compile(model)
   
   # Optimizer
-  optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) # AdamW is a bug fixed of Adam
-  steps = 50
+  optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)  
+  max_lr = 3e-4
+  min_lr = max_lr * 0.1
+  warmup_steps = 10
+  max_steps = 50
+  
+  # Scheduler
+  def get_lr(it):
+      # 1) Linear warmup for warmup_iters steps
+      if it < warmup_steps:
+          return max_lr * (it+1) / warmup_steps
+      # 2) If it > lr_decay_iters, return min learning rate
+      if it > max_steps:
+          return min_lr
+      # 3) In between, use cosine decay don to min learning rate
+      decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+      assert 0 <= decay_ratio <= 1
+      coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # Coeff starts at 1 and goes to 0
+      return min_lr + coeff * (max_lr - min_lr)
+  # NOTE: Pytorch also has a scheduler
+  
   import time
-  for i in range(steps):
+  for step in range(max_steps):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
@@ -312,14 +359,30 @@ def main():
         # model.transformer.wte.weights
         # model.transformer.wte.weights.dtype   # torch.float32
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    """clip_grad_norm notes
+    # Calculate global norm of the parameters, square and add it all up, then sqrt it
+    # and gradient is no more than 1.0.
+
+    # This is used because 
+    # during optimization, you may get high loss (maybe due to bad data batch or unlucky)
+    # which can cause a shock to the model.
+    # Clip it to prevent loss from going too big.
+    
+    # This can be visualized o get a good idea of how the model is going.
+    """
+    
+    # Update learning rate
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0)*1000 # Time difference in milliseconds
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"Step {i+1}, Loss: {loss.item()}, Dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
-    
-  
+    print(f"Step {step+1:4d} | Loss: {loss.item():.6f} | LR: {lr:.4e} | Norm: {norm:.4f} | Dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
   
   
 if __name__ == '__main__':
