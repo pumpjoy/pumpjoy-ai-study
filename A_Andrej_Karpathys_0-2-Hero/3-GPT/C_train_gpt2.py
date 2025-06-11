@@ -198,7 +198,8 @@ class GPT(nn.Module):
     
     # Create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
     # i.e. All weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-    # Don't 1D tensors (Biases, LayerNorms, Scales).
+    # Decay 2D tensors: Embeddings and matrices that participate in linear (matmul)
+    # Don't decay 1D tensors: Biases, LayerNorms, Scales).
     decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
     nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
     optim_groups = [
@@ -301,6 +302,15 @@ def main():
   torch.manual_seed(1337)
   if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
+    
+  # Grad Accumulation
+  total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
+  B = 16 # Micro batch size
+  T = 32 # Sequence/Context Length 
+  assert total_batch_size % (B * T) == 0, "Make sure total_batch_size is divisible by B * T"
+  grad_accum_steps = total_batch_size // (B * T)
+  print(f"Total desired batch size: {total_batch_size}")
+  print(f"=> Calculated gradient accumulation steps: {grad_accum_steps}")
   
   # Dataset  
   """ Replaced with DataLoaderLite
@@ -348,17 +358,35 @@ def main():
   import time
   for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16): # <---- This line
-        logits, loss = model(x, y)
+    
+    
+    # Grad accumulation
+    for microstep in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16): # <---- This line
+            logits, loss = model(x, y) 
+        
+        """ Floating point checks
         # import code; code.interact(local=locals()) 
         # logits.dtype                          # torch.bfloat16
         # model.transformer.wte
         # model.transformer.wte.weights
         # model.transformer.wte.weights.dtype   # torch.float32
-    loss.backward()
+        """
+        
+        """ Grad accum notes
+        # We have to scale the loss to account for gradient accumulation,
+        # because the gradients just add on each successive backward().
+        # Addition of gradients corresponds to a SUM in the objective, but
+        # instead of a SUM we want a MEAN. 
+        # Scale the loss here so it comes out right. 
+        """
+        loss = loss / grad_accum_steps # For normalization: reintroduce the mean loss
+        
+        loss.backward()
+        
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     """clip_grad_norm notes
     # Calculate global norm of the parameters, square and add it all up, then sqrt it
