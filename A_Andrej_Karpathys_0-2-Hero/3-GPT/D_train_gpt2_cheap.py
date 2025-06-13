@@ -1,6 +1,6 @@
-# C_train_gpt2.py
-# This version is full powered as done by Andrej
-# With grad_accum and ddp
+# D_train_gpt2_cheap.py
+# This version is for normies who have simple GPU like me :').
+# No grad_accum 
 import math
 from dataclasses import dataclass
 import torch
@@ -18,6 +18,7 @@ def get_dataset():
       print("Lines: "+ str(len(text.splitlines())), '| Words: ' + str(len(text.split())), '| Bytes: '+ str(len(raw_bytes)))
       # This file only has ASCII characters
   return text
+
 
 class MLP(nn.Module):
 
@@ -265,11 +266,9 @@ class GPT(nn.Module):
 
 class DataLoaderLite:
     
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T):
         self.B = B
         self.T = T
-        self.process_rank = process_rank
-        self.num_processes = num_processes
     
         # At init, load tokens from disk and store in memory
         text = get_dataset()
@@ -280,8 +279,7 @@ class DataLoaderLite:
         print(f"1 epoch = {len(self.tokens) // (B*T)} batches.")
         
         # State
-        # self.current_position = 0
-        self.current_position = self.B * self.T * self.process_rank
+        self.current_position = 0
         
     def next_batch(self):
         B, T = self.B, self.T
@@ -289,12 +287,10 @@ class DataLoaderLite:
         x = (buf[:-1]).view(B, T) # Inputs
         y = (buf[1:]).view(B, T)  # Labels/Targets
         # Advance the position in tensor
-        # self.current_position += B * T
-        self.current_position += B * T * self.num_processes
+        self.current_position += B * T
         # If loading next batch would be out of bounds, reset
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            # self.current_position = 0
-            self.current_position = self.B * self.T * self.process_rank
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_position = 0
         return x, y
 
 # -------------------------------------------------------------------
@@ -302,12 +298,10 @@ def main():
   # Distributed Data Parallels (DDP)
   import os
   from torch.distributed import init_process_group, destroy_process_group
-  from torch.nn.parallel import DistributedDataParallel as DDP
-  import torch.distributed as dist
   
   # Setup DDP
   # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
-  ddp = int(os.environ.get('RANK', -1)) != -1 # Is this a ddp run?
+  ddp = int(os.environ.get('RANK', -1)) != -1 # Is this a ddp run? # 
   if ddp:
       # Use of DDP atm demands CUDA, we set the device appropriately according to rank
       assert torch.cuda.is_available(), "For now I think we need CUDA for DDP"
@@ -331,37 +325,16 @@ def main():
       elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
           device = "mps"
       print(f"Using device: {device}")
-      
-  # Pytorch: Device vs. Device_type distinction
-  device_type = "cuda" if device.startswith("cuda") else "cpu"
   
   torch.manual_seed(1337)
   if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
   
-  # Grad Accumulation
-  total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-  B = 64 # Micro batch size # Changed to match video # Since I'm not running this anyway
-  T = 1024 # Sequence/Context Length 
-  assert total_batch_size % (B * T * ddp_world_size) == 0, "Make sure total_batch_size is divisible by B * T * ddp_world_size"
-  grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
-  if master_process:
-    print(f"Total desired batch size: {total_batch_size}")
-    print(f"=> Calculated gradient accumulation steps: {grad_accum_steps}")
-  
-  # Dataset
-  """ Replaced with DataLoaderLite
-  # Get databatch 
-  text = get_dataset()
-  enc = tiktoken.get_encoding('gpt2')
-  data = text[:1000] # Data is first 1000 characters (~3000 tokens)
-  tokens = enc.encode(data)
-  buf = torch.tensor(tokens[:24+1]) # 24 = B*T # +1 is Ground truth at last token
-  x = buf[:-1].view(4, 6) # Input to Transformer
-  y = buf[1:].view(4, 6)# Label for training (with ground truth) 
-  """
-  # train_loader = DataLoaderLite(B=B, T=T)
-  train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+  # Dataset  
+  B = 16 # Micro batch size
+  T = 32 # Sequence/Context Length 
+  # train_loader = DataLoaderLite(B=16, T=32)
+  train_loader = DataLoaderLite(B=B, T=T)
   
   # Use T32 Format
   torch.set_float32_matmul_precision('high')
@@ -370,16 +343,13 @@ def main():
   model = GPT(GPTConfig(vocab_size=50304))
   model.to(device) 
   model = torch.compile(model)
-  if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
   
-  raw_model = model.module if ddp else model # Always contains the "raw" unwrapped model
-  
-  
-  max_lr = 6e-4
+  # Optimizer
+  optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)  
+  max_lr = 3e-4
   min_lr = max_lr * 0.1
-  warmup_steps = 715
-  max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+  warmup_steps = 10
+  max_steps = 50
   
   # Scheduler
   def get_lr(it):
@@ -393,86 +363,30 @@ def main():
       decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
       assert 0 <= decay_ratio <= 1
       coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # Coeff starts at 1 and goes to 0
-      return min_lr + coeff * (max_lr - min_lr)
-  # NOTE: Pytorch also has a scheduler
-  
-  # Optimizer
-  # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)  
-  optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+      return min_lr + coeff * (max_lr - min_lr) 
   
   import time
   for step in range(max_steps):
     t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    
-    # Grad accumulation
-    for microstep in range(grad_accum_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        if ddp:
-          model.require_backward_grad_sync = (microstep == grad_accum_steps - 1)
-          
-        with torch.autocast(device_type=device, dtype=torch.bfloat16): # <---- This line
-            logits, loss = model(x, y) 
-        
-        """ Floating point checks
-        # import code; code.interact(local=locals()) 
-        # logits.dtype                          # torch.bfloat16
-        # model.transformer.wte
-        # model.transformer.wte.weights
-        # model.transformer.wte.weights.dtype   # torch.float32
-        """
-        
-        """ Grad accum notes
-        # We have to scale the loss to account for gradient accumulation,
-        # because the gradients just add on each successive backward().
-        # Addition of gradients corresponds to a SUM in the objective, but
-        # instead of a SUM we want a MEAN. 
-        # Scale the loss here so it comes out right. 
-        """
-        loss = loss / grad_accum_steps # For normalization: reintroduce the mean loss
-        loss_accum += loss.detach()
-        loss.backward()
-    # Pass the average gradient of (world_rank) next epoch's gradients
-    if ddp:
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVH)    
-    
+    with torch.autocast(device_type=device, dtype=torch.bfloat16): # <---- This line
+        logits, loss = model(x, y) 
+    loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    """clip_grad_norm notes
-    # Calculate global norm of the parameters, square and add it all up, then sqrt it
-    # and gradient is no more than 1.0.
-
-    # This is used because 
-    # during optimization, you may get high loss (maybe due to bad data batch or unlucky)
-    # which can cause a shock to the model.
-    # Clip it to prevent loss from going too big.
-    
-    # This can be visualized o get a good idea of how the model is going.
-    """
     
     # Update learning rate
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-  
+    
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
-    dt = t1 - t0 # Time difference in milliseconds
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
-    tokens_per_sec = tokens_processed / dt
-    if master_process:
-      print(f"Step {step+1:4d} | Loss: {loss.item():.6f} | LR: {lr:.4e} | Norm: {norm:.4f} | Dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-  
-  # Destroy process group at the end.
-  if ddp:
-    destroy_process_group()
-  
+    dt = (t1 - t0)*1000 # Time difference in milliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"Step {step+1:4d} | Loss: {loss.item():.6f} | LR: {lr:.4e} | Norm: {norm:.4f} | Dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
   
 if __name__ == '__main__':
   main()
-  # Simple launch:
-  # python train_gpt2.py
-  # DDP launch for e.g. 8 GPU
-  # torchrun --standalone --nproc_per_node=8 train_gpt2.py
-  pass
