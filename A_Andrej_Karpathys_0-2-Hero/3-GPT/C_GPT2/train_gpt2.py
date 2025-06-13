@@ -1,23 +1,12 @@
 # C_train_gpt2.py
 # This version is full powered as done by Andrej
 # With grad_accum and ddp
+import os
 import math
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
-import tiktoken
-
-def get_dataset():
-  import urllib.request
-  url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
-  with urllib.request.urlopen(url) as response:
-      raw_bytes = response.read()
-      text = raw_bytes.decode('utf-8')
-      # Equivalent of word count (wc third party library)
-      print("Lines: "+ str(len(text.splitlines())), '| Words: ' + str(len(text.split())), '| Bytes: '+ str(len(raw_bytes)))
-      # This file only has ASCII characters
-  return text
+from torch.nn import functional as F 
 
 class MLP(nn.Module):
 
@@ -211,6 +200,7 @@ class GPT(nn.Module):
     
     num_decay_params = sum(p.numel() for p in decay_params)
     num_nodecay_params = sum(p.numel() for p in nodecay_params)
+    # if master_process:
     print(f"Num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameterss")
     print(f"Num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
 
@@ -218,6 +208,7 @@ class GPT(nn.Module):
     import inspect
     fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
     use_fused = fused_available and 'cuda' in device
+    # if master_process:
     print(f"Using fused AdamW: {use_fused}")
     optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
     return optimizer
@@ -242,26 +233,18 @@ class GPT(nn.Module):
       loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) # NOTE: cross-entropy uses 2-D
     return logits, loss
 
-  def forward(self, idx, targets=None):
-    # idx is of shape (B, T)
-    B, T = idx.size()
-    assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
-    # Forward the token and posisition embeddings
-    pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
-    pos_emb = self.transformer.wpe(pos) # Position embeddings of shape (T, n_embd)
-    tok_emb = self.transformer.wte(idx) # Token embeddings of shape (B, T, n_embd)
-    x = tok_emb + pos_emb # Broadcasting happening here
-    # Forward the blocks of the transformer
-    for block in self.transformer.h:
-        x = block(x)
-    # Forward the final layernorm and the classifier
-    x = self.transformer.ln_f(x)
-    logits = self.lm_head(x) # (B, T, vocab_size)
-    loss = None
-    if targets is not None:
-      loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) # NOTE: cross-entropy uses 2-D
-    return logits, loss
-  
+# -----------------------------------------------------------------------------
+'''
+def get_dataset():
+  import urllib.request
+  url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
+  with urllib.request.urlopen(url) as response:
+      raw_bytes = response.read()
+      text = raw_bytes.decode('utf-8')
+      # Equivalent of word count (wc third party library)
+      print("Lines: "+ str(len(text.splitlines())), '| Words: ' + str(len(text.split())), '| Bytes: '+ str(len(raw_bytes)))
+      # This file only has ASCII characters
+  return text
 
 class DataLoaderLite:
     
@@ -296,6 +279,57 @@ class DataLoaderLite:
             # self.current_position = 0
             self.current_position = self.B * self.T * self.process_rank
         return x, y
+'''
+
+import tiktoken
+import numpy as np
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    npt = npt.astype(np.int32) # added after video
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
+class DataLoaderLite:
+    def __init__(self, B, T, process_rank, num_processes, split):
+        self.B = B
+        self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        assert split in {'train', 'val'}
+
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        # if master_process:
+        print(f"found {len(shards)} shards for split {split}")
+        self.reset()
+
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance the position in the tensor
+        self.current_position += B * T * self.num_processes
+        # if loading the next batch would be out of bounds, advance to next shard
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank
+        return x, y
+
 
 # -------------------------------------------------------------------
 def main():
@@ -343,6 +377,7 @@ def main():
   total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
   B = 64 # Micro batch size # Changed to match video # Since I'm not running this anyway
   T = 1024 # Sequence/Context Length 
+  # Note: No grad_accum will occur because B*T*8 == total_batch_size in Andrej's 8 GPU instance
   assert total_batch_size % (B * T * ddp_world_size) == 0, "Make sure total_batch_size is divisible by B * T * ddp_world_size"
   grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
   if master_process:
@@ -361,8 +396,9 @@ def main():
   y = buf[1:].view(4, 6)# Label for training (with ground truth) 
   """
   # train_loader = DataLoaderLite(B=B, T=T)
-  train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
-  
+  # train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+  train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+   
   # Use T32 Format
   torch.set_float32_matmul_precision('high')
   
