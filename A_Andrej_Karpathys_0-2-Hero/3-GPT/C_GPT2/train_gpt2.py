@@ -398,7 +398,8 @@ def main():
   # train_loader = DataLoaderLite(B=B, T=T)
   # train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
   train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-   
+  val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+
   # Use T32 Format
   torch.set_float32_matmul_precision('high')
   
@@ -439,7 +440,32 @@ def main():
   import time
   for step in range(max_steps):
     t0 = time.time()
+    
+    # Once in a while, evaluate validation loss
+    if step % 100 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+                
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"Validation loss: {val_loss_accum.item():.4f}")
+    
+    
+    # Training loop
+    model.train()
     optimizer.zero_grad()
+    loss_accum = 0.0
     
     # Grad accumulation
     for microstep in range(grad_accum_steps):
@@ -503,10 +529,11 @@ def main():
   # Destroy process group at the end.
   if ddp:
     destroy_process_group()
-  
-  
+
+
 if __name__ == '__main__':
-  main()
+  # main()
+  
   # Simple launch:
   # python train_gpt2.py
   # DDP launch for e.g. 8 GPU
