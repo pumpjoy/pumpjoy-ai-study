@@ -1,3 +1,4 @@
+# Directly copied from Andrej's https://github.com/karpathy/build-nanogpt/blob/master/fineweb.py
 # fineweb.py
 # Downloads and Loads FineWeb-Edu
 # Is GPT2 tokens so things learnt in B-Tokenizer 
