@@ -1,6 +1,10 @@
 # C_train_gpt2.py
 # This version is full powered as done by Andrej
 # With grad_accum and ddp
+
+# I currently have no way of knowing if this code works.
+# Check Andrej Karpathy's video, seriously.
+
 import os
 import math
 from dataclasses import dataclass
@@ -464,7 +468,15 @@ def main():
     # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)  
     optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
     
+    # create the log directory we will write checkpoints to and log to
+    log_dir = "log"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"log.txt")
+    with open(log_file, "w") as f: # Open for writing to clear the file
+        pass
+    
     import time
+    from hellaswag import render_example, iterate_examples
     for step in range(max_steps):
         t0 = time.time()
         last_step = (step == max_steps - 1)
@@ -488,10 +500,25 @@ def main():
                 dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
             if master_process:
                 print(f"Validation loss: {val_loss_accum.item():.4f}")
+                with open(log_file, "a") as f:
+                    f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+                if step > 0 and (step % 5000 == 0 or last_step):
+                    # Optionally write model checkpoints
+                    checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'config': raw_model.config,
+                        'step': step,
+                        'val_loss': val_loss_accum.item()
+                    }
+                    # Andrej: 
+                    # You might also want to add optimizer.state_dict() and
+                    # rng seeds etc., if you wanted to more exactly resume training
+                    torch.save(checkpoint, checkpoint_path)
+                    # NOTE: Save best checkpoint is also a thing.
                 
         # Once in a while, evaluate hellswag
-        # hellaswag.py
-        from hellaswag import render_example, iterate_examples
+        
         if (step % 250 == 0 or last_step) and (not use_compile):
             num_correct_norm = 0
             num_total = 0
@@ -521,6 +548,8 @@ def main():
             acc_norm = num_correct_norm / num_total
             if master_process:
                 print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}") 
+                with open(log_file, "a") as f:
+                    f.write(f"{step} hella {acc_norm:.4f}\n")
 
         # Once in a while, Generate from the model (except step 0, which is noise)
         if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
@@ -624,11 +653,12 @@ def main():
         tokens_per_sec = tokens_processed / dt
         if master_process:
             print(f"Step {step+1:4d} | Loss: {loss.item():.6f} | LR: {lr:.4e} | Norm: {norm:.4f} | Dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} train {loss_accum.item():.6f}\n")
     
     # Destroy process group at the end.
     if ddp:
         destroy_process_group()
-
 
 if __name__ == '__main__':
   # main()

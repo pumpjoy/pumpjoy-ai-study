@@ -1,6 +1,6 @@
 # D_train_gpt2_cheap.py
 # This version is for normies who have simple GPU like me :').
-# No grad_accum 
+# No grad_accum, no fineweb-edu and hellswag eval
 import math
 from dataclasses import dataclass
 import torch
